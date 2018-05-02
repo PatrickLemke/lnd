@@ -233,9 +233,12 @@ func lndMain() error {
 		// Create the macaroon authentication/authorization service.
 		macaroonService, err = macaroons.NewService(
 			networkDir, macaroons.IPLockChecker,
+			macaroons.RequestHashChecker,
 		)
 		if err != nil {
-			srvrLog.Errorf("unable to create macaroon service: %v", err)
+			srvrLog.Errorf(
+				"unable to create macaroon service: %v", err,
+			)
 			return err
 		}
 		defer macaroonService.Close()
