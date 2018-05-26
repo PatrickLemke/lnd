@@ -123,6 +123,10 @@ var (
 			Entity: "invoices",
 			Action: "write",
 		},
+		{
+			Entity: "macaroon",
+			Action: "write",
+		},
 	}
 
 	// invoicePermissions is a slice of all the entities that allows a user
@@ -325,6 +329,10 @@ var (
 		"/lnrpc.Lightning/ForwardingHistory": {{
 			Entity: "offchain",
 			Action: "read",
+		}},
+		"/lnrpc.Lightning/NewMacaroon": {{
+			Entity: "macaroon",
+			Action: "write",
 		}},
 	}
 )
@@ -4350,6 +4358,40 @@ func (r *rpcServer) ForwardingHistory(ctx context.Context,
 			Fee:       uint64(amtInSat - amtOutSat),
 		}
 	}
+
+	return resp, nil
+}
+
+// NewMacaroon allows the creation of a new macaroon with custom read and write
+// permissions. No first-party caveats are added since this can be done offline.
+func (r *rpcServer) NewMacaroon(ctx context.Context,
+	req *lnrpc.NewMacaroonRequest) (*lnrpc.NewMacaroonResponse, error) {
+
+	rpcsLog.Debugf("[newmacaroon]")
+
+	// Map permission struct used by gRPC to the one used by the bakery.
+	requestedPermissions := make([]bakery.Op, len(req.Permissions))
+	for idx, permission := range req.Permissions {
+		requestedPermissions[idx] = bakery.Op{
+			Entity: permission.Entity,
+			Action: permission.Action,
+		}
+	}
+
+	// Bake new macaroon with the given permissions and send it binary
+	// serialized and hex encoded to the client.
+	newMac, err := r.server.macService.Oven.NewMacaroon(
+		ctx, bakery.LatestVersion, nil, requestedPermissions...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	newMacBytes, err := newMac.M().MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	resp := &lnrpc.NewMacaroonResponse{}
+	resp.Macaroon = hex.EncodeToString(newMacBytes)
 
 	return resp, nil
 }
