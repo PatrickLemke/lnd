@@ -33,8 +33,10 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lntest"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/macaroons"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"gopkg.in/macaroon.v2"
 )
 
 var (
@@ -12394,6 +12396,142 @@ func testAbandonChannel(net *lntest.NetworkHarness, t *harnessTest) {
 	cleanupForceClose(t, net, net.Bob, chanPoint)
 }
 
+// testMacaroonAuthentication makes sure that if macaroon authentication is
+// enabled on the gRPC interface, no requests with missing or invalid
+// macaroons are allowed. Further, the specific access rights (read/write,
+// entity based) and first-party caveats are tested as well.
+func testMacaroonAuthentication(net *lntest.NetworkHarness, t *harnessTest) {
+	var (
+		ctxb        = context.Background()
+		timeout     = time.Duration(time.Second * 5)
+		ctxt, _     = context.WithTimeout(ctxb, timeout)
+		infoReq     = &lnrpc.GetInfoRequest{}
+		newAddrReq  = &lnrpc.NewWitnessAddressRequest{}
+		testNode    = net.Alice
+		errContains = func(err error, str string) bool {
+			return strings.Contains(err.Error(), str)
+		}
+	)
+
+	// First test: Make sure we get an error if we use no macaroons but try
+	// to connect to a node that has macaroon authentication enabled.
+	conn, err := testNode.ConnectRPC(false)
+	if err != nil {
+		t.Fatalf("unable to connect to alice: %v", err)
+	}
+	defer conn.Close()
+	noMacConnection := lnrpc.NewLightningClient(conn)
+	_, err = noMacConnection.GetInfo(ctxt, infoReq)
+	if err == nil || !errContains(err, "expected 1 macaroon") {
+		t.Fatalf("expected to get an error when connecting without " +
+			"macaroons")
+	}
+
+	// Second test: Ensure that an invalid macaroon also triggers an error.
+	invalidMac, _ := macaroon.New(
+		[]byte("dummy_root_key"), []byte("0"), "itest",
+		macaroon.LatestVersion,
+	)
+	conn, err = testNode.ConnectRPCWithMacaroon(invalidMac)
+	if err != nil {
+		t.Fatalf("unable to connect to alice: %v", err)
+	}
+	defer conn.Close()
+	invalidMacConnection := lnrpc.NewLightningClient(conn)
+	_, err = invalidMacConnection.GetInfo(ctxt, infoReq)
+	if err == nil || !errContains(err, "cannot get macaroon") {
+		t.Fatalf("expected to get an error when connecting with an " +
+			"invalid macaroon")
+	}
+
+	// Third test: Try to access a write method with read-only macaroon.
+	readonlyMac, err := testNode.ReadMacaroon(testNode.ReadMacPath(), 30)
+	if err != nil {
+		t.Fatalf("unable to read readonly.macaroon from node: %v", err)
+	}
+	conn, err = testNode.ConnectRPCWithMacaroon(readonlyMac)
+	if err != nil {
+		t.Fatalf("unable to connect to alice: %v", err)
+	}
+	defer conn.Close()
+	readonlyMacConnection := lnrpc.NewLightningClient(conn)
+	_, err = readonlyMacConnection.NewWitnessAddress(ctxt, newAddrReq)
+	if err == nil || !errContains(err, "permission denied") {
+		t.Fatalf("expected to get an error when connecting to " +
+			"write method with read-only macaroon")
+	}
+
+	// Fourth test: Check first-party caveat with timeout that expired
+	// 30 seconds ago.
+	timeoutMac, err := macaroons.AddConstraints(
+		readonlyMac, macaroons.TimeoutConstraint(-30),
+	)
+	if err != nil {
+		t.Fatalf("unable to add constraint to readonly macaroon: %v",
+			err)
+	}
+	conn, err = testNode.ConnectRPCWithMacaroon(timeoutMac)
+	if err != nil {
+		t.Fatalf("unable to connect to alice: %v", err)
+	}
+	defer conn.Close()
+	timeoutMacConnection := lnrpc.NewLightningClient(conn)
+	_, err = timeoutMacConnection.GetInfo(ctxt, infoReq)
+	if err == nil || !errContains(err, "macaroon has expired") {
+		t.Fatalf("expected to get an error when connecting with an " +
+			"invalid macaroon")
+	}
+
+	// Fifth test: Check first-party caveat with invalid IP address.
+	invalidIpAddrMac, err := macaroons.AddConstraints(
+		readonlyMac, macaroons.IPLockConstraint("1.1.1.1"),
+	)
+	if err != nil {
+		t.Fatalf("unable to add constraint to readonly macaroon: %v",
+			err)
+	}
+	conn, err = testNode.ConnectRPCWithMacaroon(invalidIpAddrMac)
+	if err != nil {
+		t.Fatalf("unable to connect to alice: %v", err)
+	}
+	defer conn.Close()
+	invalidIpAddrMacConnection := lnrpc.NewLightningClient(conn)
+	_, err = invalidIpAddrMacConnection.GetInfo(ctxt, infoReq)
+	if err == nil || !errContains(err, "different IP address") {
+		t.Fatalf("expected to get an error when connecting with an " +
+			"invalid macaroon")
+	}
+
+	// Sixth test: Make sure that if we do everything correct and send
+	// the admin macaroon with first-party caveats that we can satisfy
+	// we get a correct answer.
+	adminMac, err := testNode.ReadMacaroon(testNode.AdminMacPath(), 30)
+	if err != nil {
+		t.Fatalf("unable to read admin.macaroon from node: %v", err)
+	}
+	adminMac, err = macaroons.AddConstraints(
+		adminMac, macaroons.TimeoutConstraint(30),
+		macaroons.IPLockConstraint("127.0.0.1"),
+	)
+	if err != nil {
+		t.Fatalf("unable to add constraints to admin macaroon: %v", err)
+	}
+	conn, err = testNode.ConnectRPCWithMacaroon(adminMac)
+	if err != nil {
+		t.Fatalf("unable to connect to alice: %v", err)
+	}
+	defer conn.Close()
+	adminMacConnection := lnrpc.NewLightningClient(conn)
+	res, err := adminMacConnection.NewWitnessAddress(ctxt, newAddrReq)
+	if err != nil {
+		t.Fatalf("unable to get new address with valid macaroon: %v",
+			err)
+	}
+	if !strings.HasPrefix(res.Address, "r") {
+		t.Fatalf("returned address was not a regtest address")
+	}
+}
+
 type testCase struct {
 	name string
 	test func(net *lntest.NetworkHarness, t *harnessTest)
@@ -12612,6 +12750,10 @@ var testsCases = []*testCase{
 	{
 		name: "send update disable channel",
 		test: testSendUpdateDisableChannel,
+	},
+	{
+		name: "macaroon authentication",
+		test: testMacaroonAuthentication,
 	},
 }
 
