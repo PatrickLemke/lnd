@@ -306,6 +306,7 @@ func lndMain() error {
 	// connections.
 	server, err := newServer(
 		cfg.Listeners, chanDB, activeChainControl, idPrivKey,
+		macaroonService,
 	)
 	if err != nil {
 		srvrLog.Errorf("unable to create server: %v\n", err)
