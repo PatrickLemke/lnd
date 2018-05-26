@@ -290,6 +290,7 @@ func main() {
 		feeReportCommand,
 		updateChannelPolicyCommand,
 		forwardingHistoryCommand,
+		newMacaroonCommand,
 	}
 
 	if err := app.Run(os.Args); err != nil {

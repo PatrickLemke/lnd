@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/ioutil"
 	"math"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -20,11 +21,13 @@ import (
 	"github.com/golang/protobuf/jsonpb"
 	"github.com/golang/protobuf/proto"
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/urfave/cli"
 	"golang.org/x/crypto/ssh/terminal"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"gopkg.in/macaroon.v2"
 )
 
 // TODO(roasbeef): cli logic for supporting both positional and unix style
@@ -59,6 +62,17 @@ func printRespJSON(resp proto.Message) {
 	}
 
 	fmt.Println(jsonStr)
+}
+
+// stringInSlice looks for a string in a slice of strings and returns true
+// if it is found.
+func stringInSlice(a string, list []string) bool {
+	for _, b := range list {
+		if b == a {
+			return true
+		}
+	}
+	return false
 }
 
 // actionDecorator is used to add additional information and error handling
@@ -3288,5 +3302,238 @@ func forwardingHistory(ctx *cli.Context) error {
 	}
 
 	printRespJSON(resp)
+	return nil
+}
+
+var newMacaroonCommand = cli.Command{
+	Name:     "newmacaroon",
+	Category: "Macaroons",
+	Usage: "Bakes a new macaroon with the provided list of " +
+		"permissions and restrictions",
+	ArgsUsage: "--permission=entity/action [--format= | --save_to=] " +
+		"[--timeout=] [--ip_address=]",
+	Description: `
+	Create a new macaroon that grants the provided permissions and
+	optionally adds restrictions (timeout, IP address) to it.
+
+	The new macaroon can be shown on command line either in JSON
+	(--format=json) or hex (--format=hex) serialized format.
+	Or it can be saved directly to a file using the --save_to argument.
+
+	A permission is a tuple of an entity and an action.
+	The following entities are available in lnd:
+		* onchain
+		* offchain
+		* address
+		* message
+		* peers
+		* info
+		* invoices
+		* macaroon
+
+	The action can be either 'read' or 'write'.
+	Multiple operations can be added, for example:
+
+	--permission=info/read --permission=invoices/write --permission=...
+	`,
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name: "format",
+			Usage: "the format to serialize and display the " +
+				"macaroon in on the command line, must be " +
+				"either 'json' or 'hex' (default 'json')",
+		},
+		cli.StringFlag{
+			Name: "save_to",
+			Usage: "save the delegated macaroon to this file " +
+				"using the ",
+		},
+		cli.Uint64Flag{
+			Name: "timeout",
+			Usage: "the number of seconds the macaroon will be " +
+				"valid before it times out",
+		},
+		cli.StringFlag{
+			Name:  "ip_address",
+			Usage: "the IP address the maracoon will be bound to",
+		},
+		cli.StringSliceFlag{
+			Name: "permission",
+			Usage: "permission to include in the macaroon, " +
+				"expressed as a tuple of entity/action",
+		},
+	},
+	Action: actionDecorator(newMacaroon),
+}
+
+func newMacaroon(ctx *cli.Context) error {
+	ctxb := context.Background()
+	client, cleanUp := getClient(ctx)
+	defer cleanUp()
+
+	var (
+		format, savePath  string
+		timeout           int64
+		ipAddress         net.IP
+		permissionSlice   []string
+		parsedPermissions []*lnrpc.MacaroonPermission
+		err               error
+		validActions      = []string{"read", "write"}
+		validEntities     = []string{
+			"onchain", "offchain", "address", "message",
+			"peers", "info", "invoices", "macaroon",
+		}
+	)
+	args := ctx.Args()
+
+	// Parse command line arguments. Positional arguments cannot be
+	// implemented because we have a dynamic number of --permission
+	// arguments and all other flags are optional. So we wouldn't really
+	// know what is in what position.
+	if args.Present() {
+		return fmt.Errorf("positional arguments are not supported by " +
+			"this command, please use named arguments (for " +
+			"example --permission=xyz)")
+	}
+	if ctx.IsSet("format") || ctx.String("format") != "" {
+		format = ctx.String("format")
+		if format != "json" && format != "hex" {
+			return fmt.Errorf("format must be either 'json' or " +
+				"'hex'")
+		}
+	}
+	if ctx.IsSet("save_to") || ctx.String("save_to") != "" {
+		savePath = cleanAndExpandPath(ctx.String("save_to"))
+	}
+	if ctx.IsSet("timeout") {
+		timeout = ctx.Int64("timeout")
+		if timeout <= 0 {
+			return fmt.Errorf("timeout must be greater than 0")
+		}
+	}
+	if ctx.IsSet("ip_address") {
+		ipAddress = net.ParseIP(ctx.String("ip_address"))
+		if ipAddress == nil {
+			return fmt.Errorf("unable to parse ip_address: %s",
+				ctx.String("ip_address"))
+		}
+	}
+	if ctx.IsSet("permission") {
+		permissionSlice = ctx.StringSlice("permission")
+	}
+	if len(permissionSlice) > 0 {
+		for _, permission := range permissionSlice {
+			if len(permission) == 0 {
+				return fmt.Errorf("unable to use empty "+
+					"permission argument: %v",
+					err)
+			}
+			tuple := strings.Split(permission, "/")
+			if len(tuple) != 2 {
+				return fmt.Errorf("unable to parse "+
+					"permission tuple: %s",
+					permission)
+			}
+			entity, action := tuple[0], tuple[1]
+			if !stringInSlice(entity, validEntities) {
+				return fmt.Errorf("invalid entity: %s", entity)
+			}
+			if !stringInSlice(action, validActions) {
+				return fmt.Errorf("invalid action: %s", action)
+			}
+
+			// No we can assume that we have a valid entity/action
+			// tuple.
+			parsedPermissions = append(parsedPermissions,
+				&lnrpc.MacaroonPermission{
+					Entity: entity,
+					Action: action,
+				})
+		}
+	} else {
+		return fmt.Errorf("missing at least one permission argument")
+	}
+
+	// The arguments --format and --save_to cannot be used at the same time
+	// since --save_to always saves the file in the default binary
+	// serialized format that LND can read.
+	if format != "" && savePath != "" {
+		return fmt.Errorf("cannot use --format and --save_to at the " +
+			"same time")
+	}
+
+	// Now we have gathered all the input we need and can do the actual
+	// RPC call.
+	req := &lnrpc.NewMacaroonRequest{parsedPermissions}
+	resp, err := client.NewMacaroon(ctxb, req)
+	if err != nil {
+		return err
+	}
+
+	// Now we should have gotten a valid macaroon. Unmarshal it so we
+	// can add first-party caveats (if necessary) to it.
+	macBytes, err := hex.DecodeString(resp.Macaroon)
+	if err != nil {
+		return err
+	}
+	deserializedMac := &macaroon.Macaroon{}
+	if err = deserializedMac.UnmarshalBinary(macBytes); err != nil {
+		return err
+	}
+
+	// Now apply the desired constraints to the macaroon.
+	// This will always create a new macaroon object, even if no constraints
+	// are added.
+	macConstraints := []macaroons.Constraint{}
+	if timeout > 0 {
+		macConstraints = append(macConstraints,
+			macaroons.TimeoutConstraint(timeout))
+	}
+	if ipAddress != nil {
+		macConstraints = append(macConstraints,
+			macaroons.IPLockConstraint(ipAddress.String()))
+	}
+	constrainedMac, err := macaroons.AddConstraints(deserializedMac,
+		macConstraints...)
+	if err != nil {
+		fatal(err)
+	}
+	binaryString, err := constrainedMac.MarshalBinary()
+	if err != nil {
+		fatal(err)
+	}
+
+	// If a file path was specified, write the macaroon to that file.
+	if savePath != "" {
+		err = ioutil.WriteFile(
+			savePath, binaryString, 0644,
+		)
+		if err != nil {
+			os.Remove(savePath)
+			return err
+		}
+		fmt.Printf("Macaroon saved to %s\n", savePath)
+		return nil
+	}
+
+	// Otherwise serialize the macaroon using the requested format and then
+	// print it to standard output. Both formats produce JSON as an output:
+	//  - 'hex':  prints a JSON object with one single string
+	//            property 'macaroon'
+	//  - 'json': directly prints the JSON serialized macaroon
+	if format == "hex" {
+		printJSON(map[string]string{
+			"macaroon": hex.EncodeToString(binaryString),
+		})
+	} else {
+		jsonBytes, err := constrainedMac.MarshalJSON()
+		if err != nil {
+			fatal(err)
+		}
+		var out bytes.Buffer
+		json.Indent(&out, jsonBytes, "", "\t")
+		out.WriteString("\n")
+		out.WriteTo(os.Stdout)
+	}
 	return nil
 }
