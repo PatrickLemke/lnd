@@ -5,17 +5,19 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 
 	"gopkg.in/macaroon-bakery.v2/bakery"
 	"gopkg.in/macaroon-bakery.v2/bakery/checkers"
-	macaroon "gopkg.in/macaroon.v2"
+	"gopkg.in/macaroon.v2"
 
 	"golang.org/x/net/context"
 
 	"github.com/coreos/bbolt"
+	"github.com/lightningnetwork/lnd/lnwire"
 )
 
 var (
@@ -27,10 +29,14 @@ var (
 // Service encapsulates bakery.Bakery and adds a Close() method that zeroes the
 // root key service encryption keys, as well as utility methods to validate a
 // macaroon against the bakery and gRPC middleware for macaroon-based auth.
+// Additionally, there is an account storage for accounting based macaroon
+// balances and utility methods to manage accounts.
 type Service struct {
 	bakery.Bakery
 
 	rks *RootKeyStorage
+
+	as *AccountStorage
 }
 
 // NewService returns a service backed by the macaroon Bolt DB stored in the
@@ -62,6 +68,11 @@ func NewService(dir string, checks ...Checker) (*Service, error) {
 		return nil, err
 	}
 
+	accountStore, err := NewAccountStorage(macaroonDB)
+	if err != nil {
+		return nil, err
+	}
+
 	macaroonParams := bakery.BakeryParams{
 		Location:     "lnd",
 		RootKeyStore: rootKeyStore,
@@ -83,7 +94,7 @@ func NewService(dir string, checks ...Checker) (*Service, error) {
 		}
 	}
 
-	return &Service{*svc, rootKeyStore}, nil
+	return &Service{*svc, rootKeyStore, accountStore}, nil
 }
 
 // isRegistered checks to see if the required checker has already been
@@ -187,14 +198,44 @@ func (svc *Service) ValidateMacaroon(ctx context.Context,
 	return err
 }
 
-// Close closes the database that underlies the RootKeyStore and zeroes the
-// encryption keys.
+// Close closes the database that underlies the RootKeyStore and AccountStore
+// and zeroes the encryption keys.
 func (svc *Service) Close() error {
-	return svc.rks.Close()
+	// We need to make sure both stores/DBs are closed. If both return an
+	// error, it doesn't really matter which one we return.
+	err := svc.rks.Close()
+	err2 := svc.as.Close()
+	if err != nil {
+		return err
+	}
+	if err2 != nil {
+		return err
+	}
+	return nil
 }
 
 // CreateUnlock calls the underlying root key store's CreateUnlock and returns
 // the result.
 func (svc *Service) CreateUnlock(password *[]byte) error {
 	return svc.rks.CreateUnlock(password)
+}
+
+// NewAccount calls the underlying account store's NewAccount and returns the
+// result.
+func (svc *Service) NewAccount(balance lnwire.MilliSatoshi,
+	expirationDate time.Time) (*OffChainBalanceAccount, error) {
+	return svc.as.NewAccount(balance, expirationDate)
+}
+
+// GetAccount calls the underlying account store's GetAccount and returns the
+// result.
+func (svc *Service) GetAccount(
+	id AccountIDType) (*OffChainBalanceAccount, error) {
+	return svc.as.GetAccount(id)
+}
+
+// GetAccounts calls the underlying account store's GetAccounts and returns the
+// result.
+func (svc *Service) GetAccounts() ([]*OffChainBalanceAccount, error) {
+	return svc.as.GetAccounts()
 }
