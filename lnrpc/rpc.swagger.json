@@ -602,7 +602,7 @@
     },
     "/v1/initwallet": {
       "post": {
-        "summary": "* \nInitWallet is used when lnd is starting up for the first time to fully\ninitialize the daemon and its internal wallet. At the very least a wallet\npassword must be provided. This will be used to encrypt sensitive material\non disk.",
+        "summary": "*\nInitWallet is used when lnd is starting up for the first time to fully\ninitialize the daemon and its internal wallet. At the very least a wallet\npassword must be provided. This will be used to encrypt sensitive material\non disk.",
         "description": "In the case of a recovery scenario, the user can also specify their aezeed\nmnemonic and passphrase. If set, then the daemon will use this prior state\nto initialize its internal wallet.\n\nAlternatively, this can be used along with the GenSeed RPC to obtain a\nseed, then present it to the user. Once it has been verified by the user,\nthe seed can be fed into this RPC in order to commit the new wallet.",
         "operationId": "InitWallet",
         "responses": {
@@ -1189,11 +1189,28 @@
           "type": "string",
           "format": "byte",
           "description": "*\nnew_password should be the new passphrase that will be needed to unlock the\ndaemon."
+        },
+        "stateless_init": {
+          "type": "boolean",
+          "format": "boolean",
+          "description": "*\nstateless_init is an optional argument instructing the daemon NOT to\ncreate any *.macaroon files but instead return the binary serialized admin\nmacaroon in the response."
+        },
+        "new_macaroon_root_key": {
+          "type": "boolean",
+          "format": "boolean",
+          "description": "*\nnew_macaroon_root_key is an optional argument instructing the daemon\nto rotate the macaroon root key when set to true. This will invalidate all\npreviously generated macaroons."
         }
       }
     },
     "lnrpcChangePasswordResponse": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "admin_macaroon": {
+          "type": "string",
+          "format": "byte",
+          "description": "*\nadmin_macaroon is an optional argument that contains the binary serialized\nadmin macaroon in case it was detected that the daemon was initialized\nstateless. If this argument is set, it means no *.macaroon files have been\n(re-)created by the daemon in the password change process."
+        }
+      }
     },
     "lnrpcChannel": {
       "type": "object",
@@ -1934,11 +1951,23 @@
           "type": "integer",
           "format": "int32",
           "description": "*\nrecovery_window is an optional argument specifying the address lookahead\nwhen restoring a wallet seed. The recovery window applies to each\ninvdividual branch of the BIP44 derivation paths. Supplying a recovery\nwindow of zero indicates that no addresses should be recovered, such after\nthe first initialization of the wallet."
+        },
+        "stateless_init": {
+          "type": "boolean",
+          "format": "boolean",
+          "description": "*\nstateless_init is an optional argument instructing the daemon NOT to\ncreate any *.macaroon files but instead return the binary serialized admin\nmacaroon in the response."
         }
       }
     },
     "lnrpcInitWalletResponse": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "admin_macaroon": {
+          "type": "string",
+          "format": "byte",
+          "description": "*\nadmin_macaroon is an optional argument that contains the binary serialized\nadmin macaroon in case the stateless_init argument was set to true in the\nrequest. If this argument is set, it means no *.macaroon files have been\ncreated by the daemon in the initialization process."
+        }
+      }
     },
     "lnrpcInvoice": {
       "type": "object",
@@ -2845,6 +2874,11 @@
           "type": "integer",
           "format": "int32",
           "description": "*\nrecovery_window is an optional argument specifying the address lookahead\nwhen restoring a wallet seed. The recovery window applies to each\ninvdividual branch of the BIP44 derivation paths. Supplying a recovery\nwindow of zero indicates that no addresses should be recovered, such after\nthe first initialization of the wallet."
+        },
+        "stateless_init": {
+          "type": "boolean",
+          "format": "boolean",
+          "description": "*\nstateless_init is an optional argument instructing the daemon NOT to\ncreate any *.macaroon files."
         }
       }
     },

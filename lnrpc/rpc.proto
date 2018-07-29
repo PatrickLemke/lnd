@@ -7,19 +7,19 @@ package lnrpc;
  * Comments in this file will be directly parsed into the API
  * Documentation as descriptions of the associated method, message, or field.
  * These descriptions should go right above the definition of the object, and
- * can be in either block or /// comment format. 
- * 
+ * can be in either block or /// comment format.
+ *
  * One edge case exists where a // comment followed by a /// comment in the
  * next line will cause the description not to show up in the documentation. In
  * that instance, simply separate the two comments with a blank line.
- * 
+ *
  * An RPC method can be matched to an lncli command by placing a line in the
  * beginning of the description in exactly the following format:
  * lncli: `methodname`
- * 
+ *
  * Failure to specify the exact name of the command will cause documentation
  * generation to fail.
- * 
+ *
  * More information on how exactly the gRPC documentation is generated from
  * this proto file can be found here:
  * https://github.com/lightninglabs/lightning-api
@@ -44,7 +44,7 @@ service WalletUnlocker {
         };
     }
 
-    /** 
+    /**
     InitWallet is used when lnd is starting up for the first time to fully
     initialize the daemon and its internal wallet. At the very least a wallet
     password must be provided. This will be used to encrypt sensitive material
@@ -147,8 +147,22 @@ message InitWalletRequest {
     the first initialization of the wallet.
     */
     int32 recovery_window = 4;
+
+    /**
+    stateless_init is an optional argument instructing the daemon NOT to
+    create any *.macaroon files but instead return the binary serialized admin
+    macaroon in the response.
+    */
+    bool stateless_init = 5;
 }
 message InitWalletResponse {
+    /**
+    admin_macaroon is an optional argument that contains the binary serialized
+    admin macaroon in case the stateless_init argument was set to true in the
+    request. If this argument is set, it means no *.macaroon files have been
+    created by the daemon in the initialization process.
+    */
+    bytes admin_macaroon = 1;
 }
 
 message UnlockWalletRequest {
@@ -167,6 +181,12 @@ message UnlockWalletRequest {
     the first initialization of the wallet.
     */
     int32 recovery_window = 2;
+    
+    /**
+    stateless_init is an optional argument instructing the daemon NOT to
+    create any *.macaroon files.
+    */
+    bool stateless_init = 3;
 }
 message UnlockWalletResponse {}
 
@@ -182,14 +202,36 @@ message ChangePasswordRequest {
     daemon.
     */
     bytes new_password = 2;
+
+    /**
+    stateless_init is an optional argument instructing the daemon NOT to
+    create any *.macaroon files but instead return the binary serialized admin
+    macaroon in the response.
+    */
+    bool stateless_init = 3;
+    
+    /**
+    new_macaroon_root_key is an optional argument instructing the daemon
+    to rotate the macaroon root key when set to true. This will invalidate all
+    previously generated macaroons.
+    */
+    bool new_macaroon_root_key = 4;
 }
-message ChangePasswordResponse {}
+message ChangePasswordResponse {
+    /**
+    admin_macaroon is an optional argument that contains the binary serialized
+    admin macaroon in case it was detected that the daemon was initialized
+    stateless. If this argument is set, it means no *.macaroon files have been
+    (re-)created by the daemon in the password change process.
+    */
+    bytes admin_macaroon = 1;
+}
 
 service Lightning {
     /** lncli: `walletbalance`
     WalletBalance returns total unspent outputs(confirmed and unconfirmed), all
     confirmed unspent outputs and all unconfirmed unspent outputs under control
-    of the wallet. 
+    of the wallet.
     */
     rpc WalletBalance (WalletBalanceRequest) returns (WalletBalanceResponse) {
         option (google.api.http) = {
@@ -663,7 +705,7 @@ message Transaction {
     /// The height of the block this transaction was included in
     int32 block_height = 5 [ json_name = "block_height" ];
 
-    /// Timestamp of this transaction 
+    /// Timestamp of this transaction
     int64 time_stamp = 6 [ json_name = "time_stamp" ];
 
     /// Fees paid for this transaction
@@ -780,7 +822,7 @@ message SendManyResponse {
 }
 
 message SendCoinsRequest {
-    /// The address to send coins to 
+    /// The address to send coins to
     string addr = 1;
 
     /// The amount in satoshis to send
@@ -797,7 +839,7 @@ message SendCoinsResponse {
     string txid = 1 [json_name = "txid"];
 }
 
-/** 
+/**
 `AddressType` has to be one of:
 
 - `p2wkh`: Pay to witness key hash (`WITNESS_PUBKEY_HASH` = 0)
@@ -1412,12 +1454,12 @@ message Route {
     Contains details concerning the specific forwarding details at each hop.
     */
     repeated Hop hops = 4 [json_name = "hops"];
-    
+
     /**
     The total fees in millisatoshis.
     */
     int64 total_fees_msat = 5 [json_name = "total_fees_msat"];
-    
+
     /**
     The total amount in millisatoshis.
     */
@@ -1425,7 +1467,7 @@ message Route {
 }
 
 message NodeInfoRequest {
-    /// The 33-byte hex-encoded compressed public of the target node 
+    /// The 33-byte hex-encoded compressed public of the target node
     string pub_key = 1;
 }
 
