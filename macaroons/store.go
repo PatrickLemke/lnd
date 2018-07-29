@@ -27,10 +27,10 @@ var (
 	// TODO(aakselrod): Add support for key rotation.
 	defaultRootKeyID = []byte("0")
 
-	// encryptedKeyID is the name of the database key that stores the
+	// encryptionKeyID is the name of the database key that stores the
 	// encryption key, encrypted with a salted + hashed password. The
 	// format is 32 bytes of salt, and the rest is encrypted key.
-	encryptedKeyID = []byte("enckey")
+	encryptionKeyID = []byte("enckey")
 
 	// ErrAlreadyUnlocked specifies that the store has already been
 	// unlocked.
@@ -42,6 +42,10 @@ var (
 
 	// ErrPasswordRequired specifies that a nil password has been passed.
 	ErrPasswordRequired = fmt.Errorf("a non-nil password is required")
+
+	// ErrEncKeyNotFound specifies that there was no encryption key found
+	// even if one was expected to be generated.
+	ErrEncKeyNotFound = fmt.Errorf("macaroon encryption key not found")
 )
 
 // RootKeyStorage implements the bakery.RootKeyStorage interface.
@@ -82,7 +86,7 @@ func (r *RootKeyStorage) CreateUnlock(password *[]byte) error {
 
 	return r.Update(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket(rootKeyBucketName)
-		dbKey := bucket.Get(encryptedKeyID)
+		dbKey := bucket.Get(encryptionKeyID)
 		if len(dbKey) > 0 {
 			// We've already stored a key, so try to unlock with
 			// the password.
@@ -108,12 +112,88 @@ func (r *RootKeyStorage) CreateUnlock(password *[]byte) error {
 			return err
 		}
 
-		err = bucket.Put(encryptedKeyID, encKey.Marshal())
+		err = bucket.Put(encryptionKeyID, encKey.Marshal())
 		if err != nil {
 			return err
 		}
 
 		r.encKey = encKey
+		return nil
+	})
+}
+
+// ChangePassword decrypts the macaroon root key with the old password and then
+// encrypts it again with the new password.
+func (r *RootKeyStorage) ChangePassword(oldPassword *[]byte,
+	newPassword *[]byte) error {
+	// We need the store to already be unlocked. With this we can make sure
+	// that there already is a key in the DB.
+	if r.encKey == nil {
+		return ErrStoreLocked
+	}
+
+	// Check if a nil password has been passed; return an error if so.
+	if oldPassword == nil || newPassword == nil {
+		return ErrPasswordRequired
+	}
+
+	return r.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(rootKeyBucketName)
+		encKeyDb := bucket.Get(encryptionKeyID)
+		rootKeyDb := bucket.Get(defaultRootKeyID)
+
+		// Both the encryption key and the root key mus be present
+		// otherwise we are in the wrong state to change the password.
+		if len(encKeyDb) == 0 || len(rootKeyDb) == 0 {
+			return ErrEncKeyNotFound
+		}
+
+		// Unmarshal parameters for old encryption key and derive the
+		// old key with them.
+		encKeyOld := &snacl.SecretKey{}
+		err := encKeyOld.Unmarshal(encKeyDb)
+		if err != nil {
+			return err
+		}
+		err = encKeyOld.DeriveKey(oldPassword)
+		if err != nil {
+			return err
+		}
+
+		// Create a new encryption key from the new password.
+		encKeyNew, err := snacl.NewSecretKey(
+			newPassword, snacl.DefaultN, snacl.DefaultR,
+			snacl.DefaultP,
+		)
+		if err != nil {
+			return err
+		}
+
+		// Now try to decrypt the root key with the old encryption key,
+		// encrypt it with the new one and then store it in the DB.
+		decryptedKey, err := encKeyOld.Decrypt(rootKeyDb)
+		if err != nil {
+			return err
+		}
+		rootKey := make([]byte, len(decryptedKey))
+		copy(rootKey[:], decryptedKey[:])
+		encryptedKey, err := encKeyNew.Encrypt(rootKey)
+		if err != nil {
+			return err
+		}
+		err = bucket.Put(defaultRootKeyID, encryptedKey)
+		if err != nil {
+			return err
+		}
+
+		// Finally, store the new encryption key parameters in the DB
+		// as well.
+		err = bucket.Put(encryptionKeyID, encKeyNew.Marshal())
+		if err != nil {
+			return err
+		}
+
+		r.encKey = encKeyNew
 		return nil
 	})
 }
@@ -191,6 +271,37 @@ func (r *RootKeyStorage) RootKey(_ context.Context) ([]byte, []byte, error) {
 	}
 
 	return rootKey, id, nil
+}
+
+// GenerateNewRootKey generates a new macaroon root key, replacing the previous
+// root key if it existed.
+func (r *RootKeyStorage) GenerateNewRootKey() error {
+	// We need the store to already be unlocked. With this we can make sure
+	// that there already is a key in the DB that can be replaced.
+	if r.encKey == nil {
+		return ErrStoreLocked
+	}
+	err := r.Update(func(tx *bolt.Tx) error {
+		// Create a new RootKeyLen-byte root key, encrypt it,
+		// and store it in the bucket. Any previously set key will
+		// be overwritten.
+		bucket := tx.Bucket(rootKeyBucketName)
+		rootKey := make([]byte, RootKeyLen)
+		if _, err := io.ReadFull(rand.Reader, rootKey[:]); err != nil {
+			return err
+		}
+
+		encryptedKey, err := r.encKey.Encrypt(rootKey)
+		if err != nil {
+			return err
+		}
+		return bucket.Put(defaultRootKeyID, encryptedKey)
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // Close closes the underlying database and zeroes the encryption key stored

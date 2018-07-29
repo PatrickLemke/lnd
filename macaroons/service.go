@@ -198,3 +198,16 @@ func (svc *Service) Close() error {
 func (svc *Service) CreateUnlock(password *[]byte) error {
 	return svc.rks.CreateUnlock(password)
 }
+
+// GenerateNewRootKey calls the underlying root key store's GenerateNewRootKey
+// and returns the result.
+func (svc *Service) GenerateNewRootKey() error {
+	return svc.rks.GenerateNewRootKey()
+}
+
+// ChangePassword calls the underlying root key store's ChangePassword and
+// returns the result.
+func (svc *Service) ChangePassword(oldPassword *[]byte,
+	newPassword *[]byte) error {
+	return svc.rks.ChangePassword(oldPassword, newPassword)
+}
