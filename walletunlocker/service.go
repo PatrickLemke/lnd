@@ -14,6 +14,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/btcwallet"
+	"github.com/lightningnetwork/lnd/macaroons"
 	"golang.org/x/net/context"
 )
 
@@ -36,6 +37,12 @@ type WalletInitMsg struct {
 	// recovery should be attempted, such as after the wallet's initial
 	// creation.
 	RecoveryWindow uint32
+
+	// MacResponseChannel is an optional channel for sending back
+	// the admin macaroon to the WalletUnlocker service.
+	// If the channel is not nil, the service expects a message on the
+	// channel. Otherwise it means no stateless initialization is requested.
+	MacResponseChannel chan []byte
 }
 
 // WalletUnlockMsg is a message sent by the UnlockerService when a user wishes
@@ -59,6 +66,12 @@ type WalletUnlockMsg struct {
 	// later when lnd actually uses it). Because unlocking involves scrypt
 	// which is resource intensive, we want to avoid doing it twice.
 	Wallet *wallet.Wallet
+
+	// MacResponseChannel is an optional channel for sending back
+	// the admin macaroon to the WalletUnlocker service.
+	// If the channel is not nil, the service expects a message on the
+	// channel. Otherwise it means no stateless initialization is requested.
+	MacResponseChannel chan []byte
 }
 
 // UnlockerService implements the WalletUnlocker service used to provide lnd
@@ -74,21 +87,30 @@ type UnlockerService struct {
 	// sent.
 	UnlockMsgs chan *WalletUnlockMsg
 
-	chainDir      string
-	netParams     *chaincfg.Params
+	chainDir  string
+	netParams *chaincfg.Params
+
+	// macaroonDatabaseDir is the path to the directory that contains the
+	// macaroon database file.
+	macaroonDatabaseDir string
+
+	// macaroonFiles is the path to the three generated macaroons with
+	// different access permissions. These might not exist in a stateless
+	// initialization of lnd.
 	macaroonFiles []string
 }
 
 // New creates and returns a new UnlockerService.
-func New(chainDir string, params *chaincfg.Params,
+func New(chainDir string, params *chaincfg.Params, macaroonDatabaseDir string,
 	macaroonFiles []string) *UnlockerService {
 
 	return &UnlockerService{
-		InitMsgs:      make(chan *WalletInitMsg, 1),
-		UnlockMsgs:    make(chan *WalletUnlockMsg, 1),
-		chainDir:      chainDir,
-		netParams:     params,
-		macaroonFiles: macaroonFiles,
+		InitMsgs:            make(chan *WalletInitMsg, 1),
+		UnlockMsgs:          make(chan *WalletUnlockMsg, 1),
+		chainDir:            chainDir,
+		netParams:           params,
+		macaroonDatabaseDir: macaroonDatabaseDir,
+		macaroonFiles:       macaroonFiles,
 	}
 }
 
@@ -233,6 +255,18 @@ func (u *UnlockerService) InitWallet(ctx context.Context,
 		RecoveryWindow: uint32(recoveryWindow),
 	}
 
+	// The client instructs us to do a stateless initialization where no
+	// macaroons should be created by the daemon. This is signaled to the
+	// daemon by initializing the response channel. Once the expected
+	// macaroon response arrives, we directly forward it to the client.
+	if in.StatelessInit {
+		initMsg.MacResponseChannel = make(chan []byte)
+		u.InitMsgs <- initMsg
+		return &lnrpc.InitWalletResponse{
+			AdminMacaroon: <-initMsg.MacResponseChannel,
+		}, nil
+	}
+
 	u.InitMsgs <- initMsg
 
 	return &lnrpc.InitWalletResponse{}, nil
@@ -275,6 +309,22 @@ func (u *UnlockerService) UnlockWallet(ctx context.Context,
 		Passphrase:     password,
 		RecoveryWindow: recoveryWindow,
 		Wallet:         unlockedWallet,
+	}
+
+	// The client instructs us to do a stateless initialization where no
+	// macaroons should be created by the daemon. This is signaled to the
+	// daemon by initializing the response channel. We don't need the
+	// returned macaroon for this operation, so we read it but then discard
+	// it.
+	if in.StatelessInit {
+		walletUnlockMsg.MacResponseChannel = make(chan []byte)
+		u.UnlockMsgs <- walletUnlockMsg
+
+		// We need to read from the channel to let the daemon continue
+		// its work, but for this operation we don't need the result
+		// since the admin macaroon did not change.
+		_ = <-walletUnlockMsg.MacResponseChannel
+		return &lnrpc.UnlockWalletResponse{}, nil
 	}
 
 	// At this point we was able to open the existing wallet with the
@@ -328,15 +378,23 @@ func (u *UnlockerService) ChangePassword(ctx context.Context,
 	// Unload the wallet to allow lnd to open it later on.
 	defer loader.UnloadWallet()
 
-	// Since the macaroon database is also encrypted with the wallet's
-	// password, we'll remove all of the macaroon files so that they're
-	// re-generated at startup using the new password. We'll make sure to do
-	// this after unlocking the wallet to ensure macaroon files don't get
-	// deleted with incorrect password attempts.
-	for _, file := range u.macaroonFiles {
-		err := os.Remove(file)
-		if err != nil && !os.IsNotExist(err) {
-			return nil, err
+	// Before we actually change the password, we need to check if all flags
+	// were set correctly.
+	// The content of the previously generated macaroon files will become
+	// invalid after we generate a new root key. So we try to delete them
+	// here and they will be recreated during normal startup later.
+	// If they are missing, this is only an error if the stateless_init
+	// flag was not set.
+	if in.NewMacaroonRootKey || in.StatelessInit {
+		for _, file := range u.macaroonFiles {
+			err := os.Remove(file)
+			if err != nil && !in.StatelessInit {
+				return nil, fmt.Errorf("could not remove "+
+					"macaroon file: %v. if the wallet "+
+					"was initialized stateless please "+
+					"add the --stateless_init "+
+					"flag", err)
+			}
 		}
 	}
 
@@ -349,6 +407,49 @@ func (u *UnlockerService) ChangePassword(ctx context.Context,
 	if err != nil {
 		return nil, fmt.Errorf("unable to change wallet passphrase: "+
 			"%v", err)
+	}
+
+	// Attempt to open the macaroon DB, unlock it and then change the
+	// passphrase.
+	macaroonService, err := macaroons.NewService(u.macaroonDatabaseDir)
+	if err != nil {
+		return nil, err
+	}
+	err = macaroonService.CreateUnlock(&privatePw)
+	if err != nil {
+		macaroonService.Close()
+		return nil, err
+	}
+	err = macaroonService.ChangePassword(&privatePw, &in.NewPassword)
+	if err != nil {
+		macaroonService.Close()
+		return nil, err
+	}
+
+	// If requested by the user, attempt to replace the existing macaroon
+	// root key with a new one.
+	if in.NewMacaroonRootKey {
+		err = macaroonService.GenerateNewRootKey()
+		if err != nil {
+			macaroonService.Close()
+			return nil, err
+		}
+	}
+
+	// Close the macaroon service now to remove the lock on it. The daemon
+	// will open it in its startup process again.
+	macaroonService.Close()
+
+	// If we detected that the daemon was initialized stateless, we need
+	// to provide it with a response channel through which the admin
+	// macaroon can be sent back to the caller of the RPC interface.
+	if in.StatelessInit {
+		unlockMsg := &WalletUnlockMsg{Passphrase: in.NewPassword}
+		unlockMsg.MacResponseChannel = make(chan []byte)
+		u.UnlockMsgs <- unlockMsg
+		return &lnrpc.ChangePasswordResponse{
+			AdminMacaroon: <-unlockMsg.MacResponseChannel,
+		}, nil
 	}
 
 	// Finally, send the new password across the UnlockPasswords channel to

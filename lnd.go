@@ -196,11 +196,12 @@ func lndMain() error {
 	proxyOpts := []grpc.DialOption{grpc.WithTransportCredentials(cCreds)}
 
 	var (
-		privateWalletPw = lnwallet.DefaultPrivatePassphrase
-		publicWalletPw  = lnwallet.DefaultPublicPassphrase
-		birthday        = time.Now()
-		recoveryWindow  uint32
-		unlockedWallet  *wallet.Wallet
+		privateWalletPw  = lnwallet.DefaultPrivatePassphrase
+		publicWalletPw   = lnwallet.DefaultPublicPassphrase
+		birthday         = time.Now()
+		recoveryWindow   uint32
+		unlockedWallet   *wallet.Wallet
+		macaroonResponse chan []byte
 	)
 
 	// We wait until the user provides a password over RPC. In case lnd is
@@ -220,6 +221,7 @@ func lndMain() error {
 		birthday = walletInitParams.Birthday
 		recoveryWindow = walletInitParams.RecoveryWindow
 		unlockedWallet = walletInitParams.Wallet
+		macaroonResponse = walletInitParams.MacResponseChannel
 
 		if recoveryWindow > 0 {
 			ltndLog.Infof("Wallet recovery mode enabled with "+
@@ -241,24 +243,42 @@ func lndMain() error {
 		defer macaroonService.Close()
 
 		// Try to unlock the macaroon store with the private password.
+		// Ignore ErrAlreadyUnlocked since it could be unlocked by the
+		// wallet unlocker.
 		err = macaroonService.CreateUnlock(&privateWalletPw)
-		if err != nil {
+		if err != nil && err != macaroons.ErrAlreadyUnlocked {
 			srvrLog.Error(err)
 			return err
 		}
 
-		// Create macaroon files for lncli to use if they don't exist.
-		if !fileExists(cfg.AdminMacPath) && !fileExists(cfg.ReadMacPath) &&
-			!fileExists(cfg.InvoiceMacPath) {
-
-			err = genMacaroons(
-				ctx, macaroonService, cfg.AdminMacPath,
-				cfg.ReadMacPath, cfg.InvoiceMacPath,
+		// If the macaroon response channel is not nil, it means that
+		// the user requested a stateless initialization, where no
+		// macaroon files should be created but instead the admin
+		// macaroon returned in the InitWallet response.
+		if macaroonResponse != nil {
+			adminMacBytes, err := bakeMacaroon(
+				ctx, macaroonService, adminPermissions,
 			)
 			if err != nil {
-				ltndLog.Errorf("unable to create macaroon "+
-					"files: %v", err)
 				return err
+			}
+			macaroonResponse <- adminMacBytes
+		} else {
+			// Create macaroon files for lncli to use if they don't
+			// exist.
+			if !fileExists(cfg.AdminMacPath) &&
+				!fileExists(cfg.ReadMacPath) &&
+				!fileExists(cfg.InvoiceMacPath) {
+
+				err = genMacaroons(
+					ctx, macaroonService, cfg.AdminMacPath,
+					cfg.ReadMacPath, cfg.InvoiceMacPath,
+				)
+				if err != nil {
+					ltndLog.Errorf("unable to create "+
+						"macaroon files: %v", err)
+					return err
+				}
 			}
 		}
 	}
@@ -602,6 +622,24 @@ func genCertPair(certFile, keyFile string) error {
 	return nil
 }
 
+// bakeMacaroon creates a new macaroon with newest version and the given
+// permissions then returns it binary serialized.
+func bakeMacaroon(ctx context.Context, svc *macaroons.Service,
+	permissions []bakery.Op) ([]byte, error) {
+	mac, err := svc.Oven.NewMacaroon(
+		ctx, bakery.LatestVersion, nil, permissions...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	macBytes, err := mac.M().MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+
+	return macBytes, nil
+}
+
 // genMacaroons generates three macaroon files; one admin-level, one
 // for invoice access and one read-only. These can also be used
 // to generate more granular macaroons.
@@ -612,13 +650,7 @@ func genMacaroons(ctx context.Context, svc *macaroons.Service,
 	// access invoice related calls. This is useful for merchants and other
 	// services to allow an isolated instance that can only query and
 	// modify invoices.
-	invoiceMac, err := svc.Oven.NewMacaroon(
-		ctx, bakery.LatestVersion, nil, invoicePermissions...,
-	)
-	if err != nil {
-		return err
-	}
-	invoiceMacBytes, err := invoiceMac.M().MarshalBinary()
+	invoiceMacBytes, err := bakeMacaroon(ctx, svc, invoicePermissions)
 	if err != nil {
 		return err
 	}
@@ -629,13 +661,7 @@ func genMacaroons(ctx context.Context, svc *macaroons.Service,
 	}
 
 	// Generate the read-only macaroon and write it to a file.
-	roMacaroon, err := svc.Oven.NewMacaroon(
-		ctx, bakery.LatestVersion, nil, readPermissions...,
-	)
-	if err != nil {
-		return err
-	}
-	roBytes, err := roMacaroon.M().MarshalBinary()
+	roBytes, err := bakeMacaroon(ctx, svc, readPermissions)
 	if err != nil {
 		return err
 	}
@@ -645,14 +671,7 @@ func genMacaroons(ctx context.Context, svc *macaroons.Service,
 	}
 
 	// Generate the admin macaroon and write it to a file.
-	adminPermissions := append(readPermissions, writePermissions...)
-	admMacaroon, err := svc.Oven.NewMacaroon(
-		ctx, bakery.LatestVersion, nil, adminPermissions...,
-	)
-	if err != nil {
-		return err
-	}
-	admBytes, err := admMacaroon.M().MarshalBinary()
+	admBytes, err := bakeMacaroon(ctx, svc, adminPermissions)
 	if err != nil {
 		return err
 	}
@@ -683,6 +702,12 @@ type WalletUnlockParams struct {
 	// later when lnd actually uses it). Because unlocking involves scrypt
 	// which is resource intensive, we want to avoid doing it twice.
 	Wallet *wallet.Wallet
+
+	// MacResponseChannel is an optional channel for sending back
+	// the admin macaroon to the WalletUnlocker service.
+	// If the channel is not nil, the service expects a message on the
+	// channel. Otherwise it means no stateless initialization is requested.
+	MacResponseChannel chan []byte
 }
 
 // waitForWalletPassword will spin up gRPC and REST endpoints for the
@@ -701,16 +726,15 @@ func waitForWalletPassword(grpcEndpoints, restEndpoints []net.Addr,
 		chainConfig = cfg.Litecoin
 	}
 
-	// The macaroon files are passed to the wallet unlocker since they are
-	// also encrypted with the wallet's password. These files will be
-	// deleted within it and recreated when successfully changing the
-	// wallet's password.
+	// The macaroonFiles are passed to the wallet unlocker so they can be
+	// deleted and recreated in case the root macaroon key is also changed
+	// during the change password operation.
 	macaroonFiles := []string{
-		filepath.Join(networkDir, macaroons.DBFilename),
 		cfg.AdminMacPath, cfg.ReadMacPath, cfg.InvoiceMacPath,
 	}
 	pwService := walletunlocker.New(
-		chainConfig.ChainDir, activeNetParams.Params, macaroonFiles,
+		chainConfig.ChainDir, activeNetParams.Params,
+		networkDir, macaroonFiles,
 	)
 	lnrpc.RegisterWalletUnlockerServer(grpcServer, pwService)
 
@@ -837,10 +861,11 @@ func waitForWalletPassword(grpcEndpoints, restEndpoints []net.Addr,
 		}
 
 		walletInitParams := &WalletUnlockParams{
-			Password:       password,
-			Birthday:       birthday,
-			RecoveryWindow: recoveryWindow,
-			Wallet:         newWallet,
+			Password:           password,
+			Birthday:           birthday,
+			RecoveryWindow:     recoveryWindow,
+			Wallet:             newWallet,
+			MacResponseChannel: initMsg.MacResponseChannel,
 		}
 
 		return walletInitParams, nil
@@ -849,9 +874,10 @@ func waitForWalletPassword(grpcEndpoints, restEndpoints []net.Addr,
 	// unlocked. So we'll just return these passphrases.
 	case unlockMsg := <-pwService.UnlockMsgs:
 		walletInitParams := &WalletUnlockParams{
-			Password:       unlockMsg.Passphrase,
-			RecoveryWindow: unlockMsg.RecoveryWindow,
-			Wallet:         unlockMsg.Wallet,
+			Password:           unlockMsg.Passphrase,
+			RecoveryWindow:     unlockMsg.RecoveryWindow,
+			Wallet:             unlockMsg.Wallet,
+			MacResponseChannel: unlockMsg.MacResponseChannel,
 		}
 		return walletInitParams, nil
 

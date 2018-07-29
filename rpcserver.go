@@ -147,6 +147,10 @@ var (
 		},
 	}
 
+	// adminPermissions is a slice of all the entities that exist, giving
+	// a user full admin access to all RPCs.
+	adminPermissions = append(readPermissions, writePermissions...)
+
 	// permissions maps RPC calls to the permissions they require.
 	permissions = map[string][]bakery.Op{
 		"/lnrpc.Lightning/SendCoins": {{
