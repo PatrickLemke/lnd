@@ -270,6 +270,22 @@ func (hn *HarnessNode) Name() string {
 	return hn.cfg.Name
 }
 
+// AdminMacPath returns the filepath to the admin.macaroon file for this node.
+func (hn *HarnessNode) AdminMacPath() string {
+	return hn.cfg.AdminMacPath
+}
+
+// ReadMacPath returns the filepath to the readonly.macaroon file for this node.
+func (hn *HarnessNode) ReadMacPath() string {
+	return hn.cfg.ReadMacPath
+}
+
+// InvoiceMacPath returns the filepath to the invoice.macaroon file for this
+// node.
+func (hn *HarnessNode) InvoiceMacPath() string {
+	return hn.cfg.InvoiceMacPath
+}
+
 // Start launches a new process running lnd. Additionally, the PID of the
 // launched process is saved in order to possibly kill the process forcibly
 // later.
@@ -397,31 +413,88 @@ func (hn *HarnessNode) start(lndError chan<- error) error {
 }
 
 // Init initializes a harness node by passing the init request via rpc. After
-// the request is submitted, this method will block until an
-// macaroon-authenticated rpc connection can be established to the harness node.
+// the request is submitted, this method will block until a
+// macaroon-authenticated RPC connection can be established to the harness node.
 // Once established, the new connection is used to initialize the
 // LightningClient and subscribes the HarnessNode to topology changes.
 func (hn *HarnessNode) Init(ctx context.Context,
-	initReq *lnrpc.InitWalletRequest) error {
+	initReq *lnrpc.InitWalletRequest) (*lnrpc.InitWalletResponse, error) {
 
 	timeout := time.Duration(time.Second * 15)
 	ctxt, _ := context.WithTimeout(ctx, timeout)
-	_, err := hn.InitWallet(ctxt, initReq)
+	response, err := hn.InitWallet(ctxt, initReq)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Wait for the wallet to finish unlocking, such that we can connect to
 	// it via a macaroon-authenticated rpc connection.
 	var conn *grpc.ClientConn
 	if err = WaitPredicate(func() bool {
+		// If the node has been initialized stateless, we need to pass
+		// the macaroon to the client.
+		if initReq.StatelessInit {
+			adminMac := &macaroon.Macaroon{}
+			adminMac.UnmarshalBinary(response.AdminMacaroon)
+			if err != nil {
+				return false
+			}
+			conn, err = hn.ConnectRPCWithMacaroon(adminMac)
+			return err == nil
+		}
+
+		// Normal initialization, we expect a macaroon to be in the
+		// file system.
 		conn, err = hn.ConnectRPC(true)
 		return err == nil
 	}, 5*time.Second); err != nil {
-		return err
+		return nil, err
 	}
 
-	return hn.initLightningClient(conn)
+	return response, hn.initLightningClient(conn)
+}
+
+// InitChangePassword initializes a harness node by passing the change password
+// request via RPC. After the request is submitted, this method will block until
+// a macaroon-authenticated RPC connection can be established to the harness
+// node. Once established, the new connection is used to initialize the
+// LightningClient and subscribes the HarnessNode to topology changes.
+func (hn *HarnessNode) InitChangePassword(ctx context.Context,
+	chngPwReq *lnrpc.ChangePasswordRequest) (*lnrpc.ChangePasswordResponse,
+	error) {
+
+	timeout := time.Duration(time.Second * 15)
+	ctxt, _ := context.WithTimeout(ctx, timeout)
+	response, err := hn.ChangePassword(ctxt, chngPwReq)
+	if err != nil {
+		return nil, err
+	}
+
+	// Wait for the wallet to finish unlocking, such that we can connect to
+	// it via a macaroon-authenticated rpc connection.
+	var conn *grpc.ClientConn
+	if err = WaitPredicate(func() bool {
+		// If the node has been initialized stateless, we need to pass
+		// the macaroon to the client.
+		if chngPwReq.StatelessInit {
+			adminMac := &macaroon.Macaroon{}
+			adminMac.UnmarshalBinary(response.AdminMacaroon)
+			if err != nil {
+				return false
+			}
+			conn, err = hn.ConnectRPCWithMacaroon(adminMac)
+			return err == nil
+		}
+
+		// Normal initialization, we expect a macaroon to be in the
+		// file system.
+		conn, err = hn.ConnectRPC(true)
+		return err == nil
+	}, 5*time.Second); err != nil {
+		return nil, err
+	}
+
+	return response, hn.initLightningClient(conn)
 }
 
 // initLightningClient constructs the grpc LightningClient from the given client
@@ -499,11 +572,58 @@ func (hn *HarnessNode) writePidFile() error {
 	return nil
 }
 
+// ReadMacaroon waits a given number of seconds for the macaroon file to be
+// created. If the file is readable within the timeout, its content is
+// de-serialized as a macaroon and returned.
+func (hn *HarnessNode) ReadMacaroon(macPath string,
+	timeout time.Duration) (*macaroon.Macaroon, error) {
+	// Wait until macaroon file is created before using it, up to 30 sec.
+	macTimeout := time.After(timeout * time.Second)
+	for !fileExists(macPath) {
+		select {
+		case <-macTimeout:
+			return nil, fmt.Errorf("timeout waiting for macaroon "+
+				"file %s to be created after 30 seconds",
+				macPath)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	// Now that we know the file exists, read it and return the macaroon.
+	macBytes, err := ioutil.ReadFile(macPath)
+	if err != nil {
+		return nil, err
+	}
+	mac := &macaroon.Macaroon{}
+	if err = mac.UnmarshalBinary(macBytes); err != nil {
+		return nil, err
+	}
+	return mac, nil
+}
+
 // ConnectRPC uses the TLS certificate and admin macaroon files written by the
 // lnd node to create a gRPC client connection.
 func (hn *HarnessNode) ConnectRPC(useMacs bool) (*grpc.ClientConn, error) {
-	// Wait until TLS certificate and admin macaroon are created before
-	// using them, up to 20 sec.
+	// If we don't want to use macaroons, just pass nil, the next method
+	// will handle it correctly.
+	if !useMacs {
+		return hn.ConnectRPCWithMacaroon(nil)
+	}
+
+	// If we should use a macaroon, always take the admin macaroon as a
+	// default.
+	mac, err := hn.ReadMacaroon(hn.cfg.AdminMacPath, 30)
+	if err != nil {
+		return nil, err
+	}
+	return hn.ConnectRPCWithMacaroon(mac)
+}
+
+// ConnectRPCWithMacaroon uses the TLS certificate and given macaroon to
+// create a gRPC client connection.
+func (hn *HarnessNode) ConnectRPCWithMacaroon(
+	mac *macaroon.Macaroon) (*grpc.ClientConn, error) {
+	// Wait until TLS certificate is created before using it, up to 30 sec.
 	tlsTimeout := time.After(30 * time.Second)
 	for !fileExists(hn.cfg.TLSCertPath) {
 		select {
@@ -519,34 +639,17 @@ func (hn *HarnessNode) ConnectRPC(useMacs bool) (*grpc.ClientConn, error) {
 		grpc.WithTimeout(time.Second * 20),
 	}
 
-	tlsCreds, err := credentials.NewClientTLSFromFile(hn.cfg.TLSCertPath, "")
+	tlsCreds, err := credentials.NewClientTLSFromFile(
+		hn.cfg.TLSCertPath, "",
+	)
 	if err != nil {
 		return nil, err
 	}
 
 	opts = append(opts, grpc.WithTransportCredentials(tlsCreds))
 
-	if !useMacs {
+	if mac == nil {
 		return grpc.Dial(hn.cfg.RPCAddr(), opts...)
-	}
-
-	macTimeout := time.After(30 * time.Second)
-	for !fileExists(hn.cfg.AdminMacPath) {
-		select {
-		case <-macTimeout:
-			return nil, fmt.Errorf("timeout waiting for admin " +
-				"macaroon file to be created after 30 seconds")
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-
-	macBytes, err := ioutil.ReadFile(hn.cfg.AdminMacPath)
-	if err != nil {
-		return nil, err
-	}
-	mac := &macaroon.Macaroon{}
-	if err = mac.UnmarshalBinary(macBytes); err != nil {
-		return nil, err
 	}
 
 	macCred := macaroons.NewMacaroonCredential(mac)

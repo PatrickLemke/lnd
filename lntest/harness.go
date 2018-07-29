@@ -270,11 +270,12 @@ func (n *NetworkHarness) NewNode(name string, extraArgs []string) (*HarnessNode,
 // wallet password. The generated mnemonic is returned along with the
 // initialized harness node.
 func (n *NetworkHarness) NewNodeWithSeed(name string, extraArgs []string,
-	password []byte) (*HarnessNode, []string, error) {
+	password []byte, statelessInit bool) (*HarnessNode, []string, []byte,
+	error) {
 
 	node, err := n.newNode(name, extraArgs, true)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	timeout := time.Duration(time.Second * 15)
@@ -289,7 +290,7 @@ func (n *NetworkHarness) NewNodeWithSeed(name string, extraArgs []string,
 	ctxt, _ := context.WithTimeout(ctxb, timeout)
 	genSeedResp, err := node.GenSeed(ctxt, genSeedReq)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// With the seed created, construct the init request to the node,
@@ -298,20 +299,29 @@ func (n *NetworkHarness) NewNodeWithSeed(name string, extraArgs []string,
 		WalletPassword:     password,
 		CipherSeedMnemonic: genSeedResp.CipherSeedMnemonic,
 		AezeedPassphrase:   password,
+		StatelessInit:      statelessInit,
 	}
 
 	// Pass the init request via rpc to finish unlocking the node. This will
 	// also initialize the macaroon-authenticated LightningClient.
-	err = node.Init(ctxb, initReq)
+	response, err := node.Init(ctxb, initReq)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// With the node started, we can now record its public key within the
 	// global mapping.
 	n.RegisterNode(node)
 
-	return node, genSeedResp.CipherSeedMnemonic, nil
+	// In stateless initialization mode we get a macaroon back that we have
+	// to return to the test, otherwise gRPC calls won't be possible since
+	// since there are no macaroon files created in that mode.
+	if statelessInit {
+		return node, genSeedResp.CipherSeedMnemonic,
+			response.AdminMacaroon, nil
+	}
+
+	return node, genSeedResp.CipherSeedMnemonic, nil, nil
 }
 
 // RestoreNodeWithSeed fully initializes a HarnessNode using a chosen mnemonic,
@@ -334,7 +344,7 @@ func (n *NetworkHarness) RestoreNodeWithSeed(name string, extraArgs []string,
 		RecoveryWindow:     recoveryWindow,
 	}
 
-	err = node.Init(context.Background(), initReq)
+	_, err = node.Init(context.Background(), initReq)
 	if err != nil {
 		return nil, err
 	}
