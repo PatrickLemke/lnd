@@ -3290,3 +3290,111 @@ func forwardingHistory(ctx *cli.Context) error {
 	printRespJSON(resp)
 	return nil
 }
+
+var createAccountCommand = cli.Command{
+	Name:      "createaccount",
+	Category:  "Accounts",
+	Usage:     "Create a new off-chain account with a balance.",
+	ArgsUsage: "balance [expiration_date]",
+	Description: `
+	Adds an entry to the account database. This entry represents an amount
+	of satoshis (account balance) that can be spent using off-chain
+	transactions (e.g. paying invoices).
+
+	Macaroons can be created to be locked to an account. This makes sure
+	that the bearer of the macaroon can only spend at most that amount of
+	satoshis through the daemon that has issued the macaroon.
+
+	Accounts only assert a maximum amount spendable. Having a certain
+	account balance does not guarantee that the node has the channel
+	liquidity to actually spend that amount.
+	`,
+	Flags: []cli.Flag{
+		cli.Int64Flag{
+			Name: "balance",
+			Usage: "the initial balance of the account",
+		},
+		cli.Int64Flag{
+			Name: "expiration_date",
+			Usage: "the expiration date of the account expressed " +
+				"in seconds since the unix epoch. 0 means" +
+				"it does not expire. (default 0)",
+		},
+	},
+	Action: actionDecorator(createAccount),
+}
+
+func createAccount(ctx *cli.Context) error {
+	ctxb := context.Background()
+	client, cleanUp := getClient(ctx)
+	defer cleanUp()
+
+	var (
+		initialBalance  int64
+		expirationDate  uint64 = 0
+		err             error
+	)
+	args := ctx.Args()
+
+	switch {
+	case ctx.IsSet("balance"):
+		initialBalance = ctx.Int64("balance")
+	case args.Present():
+		initialBalance, err = strconv.ParseInt(args.First(), 10, 64)
+		if err != nil {
+			return fmt.Errorf("unable to decode balance %v", err)
+		}
+		args = args.Tail()
+	}
+
+	switch {
+	case ctx.IsSet("expiration_date"):
+		expirationDate = ctx.Uint64("expiration_date")
+	case args.Present():
+		expirationDate, err = strconv.ParseUint(args.First(), 10, 64)
+		if err != nil {
+			return fmt.Errorf(
+				"unable to decode expiration_date: %v", err,
+			)
+		}
+		args = args.Tail()
+	}
+
+	req := &lnrpc.CreateAccountRequest{
+		AccountBalance: initialBalance,
+		ExpirationDate: expirationDate,
+	}
+	resp, err := client.CreateAccount(ctxb, req)
+	if err != nil {
+		return err
+	}
+
+	printRespJSON(resp)
+	return nil
+}
+
+var listAccountsCommand = cli.Command{
+	Name:      "listaccounts",
+	Category:  "Accounts",
+	Usage:     "Lists all off-chain accounts.",
+	Description: `
+	returns all accounts that are currently stored in the account
+	database.
+	`,
+	Action: actionDecorator(listAccounts),
+}
+
+func listAccounts(ctx *cli.Context) error {
+	ctxb := context.Background()
+	client, cleanUp := getClient(ctx)
+	defer cleanUp()
+
+	req := &lnrpc.ListAccountsRequest{}
+	resp, err := client.ListAccounts(ctxb, req)
+	if err != nil {
+		return err
+	}
+
+	printRespJSON(resp)
+	return nil
+}

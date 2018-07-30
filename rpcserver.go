@@ -326,6 +326,14 @@ var (
 			Entity: "offchain",
 			Action: "read",
 		}},
+		"/lnrpc.Lightning/CreateAccount": {{
+			Entity: "offchain",
+			Action: "write",
+		}},
+		"/lnrpc.Lightning/ListAccounts": {{
+			Entity: "offchain",
+			Action: "read",
+		}},
 	}
 )
 
@@ -4351,5 +4359,93 @@ func (r *rpcServer) ForwardingHistory(ctx context.Context,
 		}
 	}
 
+	return resp, nil
+}
+
+// CreateAccount adds an entry to the account database. This entry represents
+// an amount of satoshis (account balance) that can be spent using off-chain
+// transactions (e.g. paying invoices).
+//    
+// Macaroons can be created to be locked to an account. This makes sure that
+// the bearer of the macaroon can only spend at most that amount of satoshis
+// through the daemon that has issued the macaroon.
+//    
+// Accounts only assert a maximum amount spendable. Having a certain account
+// balance does not guarantee that the node has the channel liquidity to
+// actually spend that amount.
+func (r *rpcServer) CreateAccount(ctx context.Context,
+	req *lnrpc.CreateAccountRequest) (*lnrpc.CreateAccountResponse, error) {
+	
+	rpcsLog.Debugf("[createaccount]")
+
+	var (
+		balanceMsat    lnwire.MilliSatoshi
+		expirationDate time.Time
+	)
+
+	// If the expiration date was set, parse it as an unix time stamp.
+	// Otherwise we leave it nil to indicate the account has no expiration
+	// date.
+	if req.ExpirationDate != 0 {
+		expirationDate = time.Unix(int64(req.ExpirationDate), 0)
+	}
+	
+	// Convert from satoshis to millisatoshis for storage.
+	balance := btcutil.Amount(req.AccountBalance)
+	balanceMsat = lnwire.NewMSatFromSatoshis(balance)
+	
+	// Create the actual account in the macaroon account store.
+	account, err := r.server.macService.NewAccount(
+		balanceMsat, expirationDate,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create account: %v", err)
+	}
+	
+	// Map the response into the proper response type and return it.
+	rpcAccount := &lnrpc.Account{
+		Id:             account.ID[:],
+		InitialBalance: int64(account.InitialBalance.ToSatoshis()),
+		CurrentBalance: int64(account.CurrentBalance.ToSatoshis()),
+		LastUpdate:     account.LastUpdate.Unix(),
+		ExpirationDate: account.ExpirationDate.Unix(),
+	}
+	resp := &lnrpc.CreateAccountResponse{
+		Account: rpcAccount,
+	}
+	return resp, nil
+}
+
+// ListAccounts returns all accounts that are currently stored in the account
+// database.
+func (r *rpcServer) ListAccounts(ctx context.Context,
+	req *lnrpc.ListAccountsRequest) (*lnrpc.ListAccountsResponse, error) {
+
+	rpcsLog.Debugf("[listaccounts]")
+
+	// Retrieve all accounts from the macaroon account store.
+	accounts, err := r.server.macService.GetAccounts()
+	if err != nil {
+		return nil, fmt.Errorf("unable to list accounts: %v", err)
+	}
+
+	// Map the response into the proper response type and return it.
+	rpcAccounts := make([]*lnrpc.Account, len(accounts))
+	for i, account := range accounts {
+		rpcAccounts[i] = &lnrpc.Account{
+			Id:             account.ID[:],
+			InitialBalance: int64(
+				account.InitialBalance.ToSatoshis(),
+			),
+			CurrentBalance: int64(
+				account.CurrentBalance.ToSatoshis(),
+			),
+			LastUpdate:     account.LastUpdate.Unix(),
+			ExpirationDate: account.ExpirationDate.Unix(),
+		}
+	}
+	resp := &lnrpc.ListAccountsResponse{
+		Accounts: rpcAccounts,
+	}
 	return resp, nil
 }

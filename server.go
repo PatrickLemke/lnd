@@ -41,6 +41,7 @@ import (
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/ticker"
 	"github.com/lightningnetwork/lnd/tor"
+	"github.com/lightningnetwork/lnd/macaroons"
 )
 
 const (
@@ -164,6 +165,8 @@ type server struct {
 	sphinx *htlcswitch.OnionProcessor
 
 	connMgr *connmgr.ConnManager
+	
+	macService *macaroons.Service
 
 	// globalFeatures feature vector which affects HTLCs and thus are also
 	// advertised to other nodes.
@@ -232,7 +235,8 @@ func noiseDial(idPriv *btcec.PrivateKey) func(net.Addr) (net.Conn, error) {
 // newServer creates a new instance of the server which is to listen using the
 // passed listener address.
 func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
-	privKey *btcec.PrivateKey) (*server, error) {
+	privKey *btcec.PrivateKey,
+	macService *macaroons.Service) (*server, error) {
 
 	var err error
 
@@ -269,6 +273,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 
 		identityPriv: privKey,
 		nodeSigner:   newNodeSigner(privKey),
+		macService:   macService,
 
 		listenAddrs: listenAddrs,
 
