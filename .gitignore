@@ -28,6 +28,7 @@ lnd
 lnd-debug
 lncli
 lncli-debug
+lnwallet-debug
 
 output*.log
 

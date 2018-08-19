@@ -132,14 +132,16 @@ btcd: $(GLIDE_BIN) $(BTCD_DIR)
 # ============
 
 build:
-	@$(call print, "Building debug lnd and lncli.")
+	@$(call print, "Building debug lnd/lncli and lnwallet.")
 	$(GOBUILD) -tags="$(DEV_TAGS)" -o lnd-debug $(LDFLAGS) $(PKG)
 	$(GOBUILD) -tags="$(DEV_TAGS)" -o lncli-debug $(LDFLAGS) $(PKG)/cmd/lncli
+	$(GOBUILD) -tags="$(DEV_TAGS)" -o lnwallet-debug $(LDFLAGS) $(PKG)/cmd/lnwallet
 
 install:
-	@$(call print, "Installing lnd and lncli.")
+	@$(call print, "Installing lnd/lncli and lnwallet.")
 	go install -v -tags="$(PROD_TAGS)" $(LDFLAGS) $(PKG)
 	go install -v -tags="$(PROD_TAGS)" $(LDFLAGS) $(PKG)/cmd/lncli
+	go install -v -tags="$(PROD_TAGS)" $(LDFLAGS) $(PKG)/cmd/lnwallet
 
 scratch: dep build
 
@@ -231,7 +233,7 @@ rpc:
 
 clean:
 	@$(call print, "Cleaning source.$(NC)")
-	$(RM) ./lnd-debug ./lncli-debug
+	$(RM) ./lnd-debug ./lncli-debug ./lnwallet-debug
 	$(RM) -r ./vendor .vendor-new
 
 
